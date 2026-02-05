@@ -62,8 +62,8 @@ def load_config():
         "model_name": "", 
         "custom_models": {}, # Для новых моделей, которым научили скрипт
         "link_settings": { # Настройки ссылки (что включать)
-            "include_negative": True,
-            "include_resolution": True
+            "include_negative": False,
+            "include_resolution": False
         },
         "cache_dir": CACHE_DIR
     }
