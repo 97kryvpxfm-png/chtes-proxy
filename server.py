@@ -8,21 +8,63 @@ from flask import Flask, send_file, Response
 import requests
 from datetime import datetime
 import sys
+import re
 
 # === Константы ===
 CONFIG_FILE = "config.json"
 CACHE_DIR = "./cache"
 PORT = 4444
-CHUTES_IMAGE_ENDPOINT = "https://image.chutes.ai/generate"
+
+# База знаний о моделях (на основе запросы.txt)
+KNOWN_MODELS = {
+    # Unified models (image.chutes.ai + standard params)
+    "qwen-image": {"type": "unified"},
+    "JuggernautXL-Ragnarok": {"type": "unified"},
+    "FLUX.1-schnell": {"type": "unified"},
+    "HassakuXL": {"type": "unified"},
+    "Illustrij": {"type": "unified"},
+    "stabilityai/stable-diffusion-xl-base-1.0": {"type": "unified"},
+    "diagonalge/Booba": {"type": "unified"},
+    "NovaFurryXL": {"type": "unified"},
+    "iLustMix": {"type": "unified"},
+    "Animij": {"type": "unified"},
+    "Lykon/dreamshaper-xl-1-0": {"type": "unified"},
+    "JuggernautXL": {"type": "unified"},
+    "chroma": {"type": "unified"},
+    
+    # Native models (Specific URL patterns)
+    "z-image-turbo": {
+        "type": "native",
+        "url_template": "https://chutes-{model}.chutes.ai/generate",
+        "supports_negative": False,
+        "resolution_format": "none"
+    },
+    "hunyuan-image-3": {
+        "type": "native",
+        "url_template": "https://chutes-{model}.chutes.ai/generate",
+        "supports_negative": False,
+        "resolution_format": "none"
+    },
+    "hidream": {
+        "type": "native",
+        "url_template": "https://chutes-{model}.chutes.ai/generate",
+        "supports_negative": False,
+        "resolution_format": "string" # resolution: "1024x1024"
+    }
+}
 
 # === Функции конфигурации ===
 
 def load_config():
     """Загрузить конфигурацию из config.json"""
     default_config = {
-        "api_key": "",
-        "model_name": "",
-        "provider_type": "unified", # 'unified' (сторонние) или 'chutes' (родные)
+        "api_key": "", 
+        "model_name": "", 
+        "custom_models": {}, # Для новых моделей, которым научили скрипт
+        "link_settings": { # Настройки ссылки (что включать)
+            "include_negative": True,
+            "include_resolution": True
+        },
         "cache_dir": CACHE_DIR
     }
     if not os.path.exists(CONFIG_FILE):
@@ -30,10 +72,13 @@ def load_config():
     try:
         with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
             config = json.load(f)
-            # Дополнить дефолтными значениями если ключей нет
+            # Дополнить дефолтными значениями
             for k, v in default_config.items():
                 if k not in config:
                     config[k] = v
+            # Рекурсивный мердж для link_settings
+            if "link_settings" not in config:
+                 config["link_settings"] = default_config["link_settings"]
             return config
     except Exception as e:
         print(f"Ошибка чтения конфига: {e}")
@@ -47,75 +92,172 @@ def save_config(config):
     except Exception as e:
         print(f"Ошибка сохранения конфига: {e}")
 
-def validate_api_key(key):
-    """Проверка формата API ключа"""
-    return (key.startswith("cpk_") or key.startswith("sk_")) and len(key) >= 20
+def get_model_info(model_name, config):
+    """Получить метаданные модели (из базы или custom_models)"""
+    if not model_name:
+        return None
+    
+    # 1. Проверяем в известных (точное совпадение)
+    if model_name in KNOWN_MODELS:
+        return KNOWN_MODELS[model_name]
 
-def mask_api_key(key):
-    """Маскировка API ключа для вывода"""
-    if not key:
-        return "не настроен"
-    if len(key) < 8:
-        return "****"
-    return f"{key[:4]}****{key[-4:]}"
+    # 1.1 Проверяем в известных (без учета регистра)
+    for k, v in KNOWN_MODELS.items():
+        if k.lower() == model_name.lower():
+            return v
+    
+    # 2. Проверяем в пользовательских
+    if model_name in config.get("custom_models", {}):
+        return config["custom_models"][model_name]
+    
+    return None
 
-def count_cache_files():
-    """Подсчет файлов в кэше"""
-    if not os.path.exists(CACHE_DIR):
-        return 0
-    try:
-        return len([f for f in os.listdir(CACHE_DIR) if f.endswith('.jpg')])
-    except:
-        return 0
-
-def configure_api_key(config):
-    """Интерактивная настройка API ключа"""
-    key = input("Введите API ключ от Chutes AI: ").strip()
-    if validate_api_key(key):
-        config["api_key"] = key
-        print("✓ API ключ сохранён")
-    else:
-        print("❌ Неверный формат API ключа (должен начинаться с cpk_ или sk_ и быть длиннее 20 символов)")
+def parse_curl_request(model_name, curl_text):
+    """Анализ curl запроса для определения возможностей модели"""
+    info = {
+        "type": "unknown",
+        "supports_negative": False,
+        "resolution_format": "none",
+        "url_template": ""
+    }
+    
+    # 1. Определяем URL и тип
+    if "image.chutes.ai/generate" in curl_text:
+        info["type"] = "unified"
+    elif ".chutes.ai/generate" in curl_text:
+        info["type"] = "native"
+        # Пытаемся извлечь шаблон URL. Обычно https://chutes-{NAME}.chutes.ai
+        # Но сохраним просто как есть, с заменой имени на плейсхолдер если получится, или хардкод
+        # Проще: извлечь полный URL из curl
+        match = re.search(r'https://[\w\-\.]+\.chutes\.ai/generate', curl_text)
+        if match:
+            url = match.group(0)
+            # Если URL содержит имя модели, заменим его на {model} для универсальности, 
+            # но для custom лучше сохранить конкретный URL
+            info["url_template"] = url
+    
+    # 2. Определяем параметры (ищем ключи в JSON)
+    if "negative_prompt" in curl_text:
+        info["supports_negative"] = True
+    
+    if "resolution" in curl_text and "x" in curl_text: # "resolution": "1024x1024"
+        info["resolution_format"] = "string"
+    elif "width" in curl_text and "height" in curl_text:
+        info["resolution_format"] = "standard"
+    
+    # Для Unified моделей обычно все стандартно
+    if info["type"] == "unified":
+        info["resolution_format"] = "standard"
+        info["supports_negative"] = True
+        
+    return info
 
 def configure_model_name(config):
-    """Настройка имени модели"""
-    print("\n📝 Как найти имя модели:")
-    print("1. Откройте страницу публичного chute в браузере")
-    print("2. Найдите кнопку 'Copy model name'")
-    print("3. Скопируйте имя модели (например: Illustrij, z-image-turbo)")
-    print("4. Посмотрите на 'Provider' рядом с именем")
-    print()
-    
-    model_name = input("Введите имя модели: ").strip()
+    """Настройка имени модели с обучением"""
+    print("\n📝 Введите имя модели (как на сайте Chutes):")
+    model_name = input("> ").strip()
     
     if not model_name:
         print("❌ Имя модели не может быть пустым")
         return
 
-    print("\nЭто 'родная' модель от провайдера Chutes?")
-    print("(Обычно это модели вроде z-image-turbo, flux-dev-schnell и т.д.)")
-    is_chutes = input("Введите 'y' если провайдер Chutes, или 'n' если другой (Illustrij и др.): ").lower().strip()
+    info = get_model_info(model_name, config)
     
-    config["model_name"] = model_name
-    if is_chutes == 'y':
-        config["provider_type"] = "chutes"
-        print(f"✓ Модель сохранена: {model_name} (Тип: Native Chutes)")
+    if info:
+        print(f"✓ Модель '{model_name}' найдена в базе.")
+        config["model_name"] = model_name
     else:
-        config["provider_type"] = "unified"
-        print(f"✓ Модель сохранена: {model_name} (Тип: Unified/Third-party)")
+        print(f"\n⚠️ Модель '{model_name}' не известна скрипту.")
+        print("Для настройки, пожалуйста, вставьте пример CURL запроса для этой модели.")
+        print("(Скопируйте его на сайте Chutes и вставьте сюда. Нажмите Enter, затем Ctrl+D (или Ctrl+Z в Win) для завершения ввода):")
+        
+        lines = []
+        try:
+            while True:
+                line = input()
+                lines.append(line)
+        except EOFError:
+            pass
+        
+        curl_text = "\n".join(lines)
+        print("\nАнализирую...")
+        
+        new_info = parse_curl_request(model_name, curl_text)
+        print(f"Результат анализа: Тип={new_info['type']}, Негатив={new_info['supports_negative']}, Разрешение={new_info['resolution_format']}")
+        
+        config["custom_models"][model_name] = new_info
+        config["model_name"] = model_name
+        print(f"✓ Модель '{model_name}' сохранена и добавлена в базу.")
+
+def configure_link_settings(config):
+    """Настройка параметров ссылки"""
+    model_name = config.get("model_name")
+    if not model_name:
+        print("❌ Сначала выберите модель")
+        return
+        
+    info = get_model_info(model_name, config)
+    if not info:
+        print("❌ Ошибка данных модели")
+        return
+
+    # Проверка поддержки
+    supports_neg = info.get("supports_negative", True) if info["type"] == "unified" else info.get("supports_negative", False)
+    supports_res = info.get("resolution_format", "standard") != "none"
+
+    print("\n🔗 Настройка параметров ссылки:")
+    
+    if supports_neg:
+        cur = "ВКЛ" if config["link_settings"]["include_negative"] else "ВЫКЛ"
+        ans = input(f"Включать негативный промпт в ссылку? (Сейчас {cur}) [y/n]: ").strip().lower()
+        if ans == 'y': config["link_settings"]["include_negative"] = True
+        elif ans == 'n': config["link_settings"]["include_negative"] = False
+    else:
+        print("- Негативный промпт: Не поддерживается моделью")
+        config["link_settings"]["include_negative"] = False
+        
+    if supports_res:
+        cur = "ВКЛ" if config["link_settings"]["include_resolution"] else "ВЫКЛ"
+        ans = input(f"Включать разрешение в ссылку? (Сейчас {cur}) [y/n]: ").strip().lower()
+        if ans == 'y': config["link_settings"]["include_resolution"] = True
+        elif ans == 'n': config["link_settings"]["include_resolution"] = False
+    else:
+        print("- Разрешение: Не поддерживается моделью")
+        config["link_settings"]["include_resolution"] = False
+
+    print("✓ Настройки ссылки обновлены")
+
+# ... функции API key, cache, etc остаются ...
+
+def validate_api_key(key):
+    return (key.startswith("cpk_") or key.startswith("sk_")) and len(key) >= 20
+
+def mask_api_key(key):
+    if not key: return "не настроен"
+    if len(key) < 8: return "****"
+    return f"{key[:4]}****{key[-4:]}"
+
+def count_cache_files():
+    if not os.path.exists(CACHE_DIR): return 0
+    try: return len([f for f in os.listdir(CACHE_DIR) if f.endswith('.jpg')])
+    except: return 0
+
+def configure_api_key(config):
+    key = input("Введите API ключ от Chutes AI: ").strip()
+    if validate_api_key(key):
+        config["api_key"] = key
+        print("✓ API ключ сохранён")
+    else:
+        print("❌ Неверный формат API ключа")
 
 def show_settings(config):
-    """Показать текущие настройки"""
     print("\nТекущая конфигурация:")
-    
-    if config.get("api_key"):
-        print(f"- API ключ: {mask_api_key(config['api_key'])}")
-    else:
-        print("- API ключ: не настроен")
+    if config.get("api_key"): print(f"- API ключ: {mask_api_key(config['api_key'])}")
+    else: print("- API ключ: не настроен")
     
     if config.get("model_name"):
-        p_type = "Native Chutes" if config.get("provider_type") == "chutes" else "Unified"
-        print(f"- Модель: {config['model_name']} ({p_type})")
+        info = get_model_info(config["model_name"], config)
+        print(f"- Модель: {config['model_name']} ({info.get('type', 'unknown')})")
     else:
         print("- Модель: не настроена")
     
@@ -124,38 +266,36 @@ def show_settings(config):
 
 def show_menu():
     """Главное меню"""
-    # Загружаем конфиг внутри цикла, чтобы обновлять статус
-    
     while True:
-        config = load_config()
+        config = load_config() # Перезагрузка конфига
         
         print("\n=== Chutes AI Image Proxy ===")
         
-        # Статус настройки
         key_status = "✅ Введен" if config.get("api_key") else "❌ Не введен"
         model_status = f"✅ Указана ({config['model_name']})" if config.get("model_name") else "❌ Не указана"
         
         print(f"Ключ: {key_status}")
         print(f"Модель: {model_status}")
         
-        # Пример ссылки
-        provider = config.get("provider_type", "unified")
-        if provider == "chutes":
-            link_example = f"http://localhost:{PORT}/prompt/[PROMPT]"
-        else:
-            link_example = f"http://localhost:{PORT}/prompt/[PROMPT]/[NEGATIVE_PROMPT]/[WIDTH]x[HEIGHT]"
+        # Генерация примера ссылки
+        link_parts = ["http://localhost:4444/prompt/[PROMPT]"]
+        if config["link_settings"].get("include_negative"):
+            link_parts.append("[NEGATIVE_PROMPT]")
+        if config["link_settings"].get("include_resolution"):
+            link_parts.append("[WIDTH]x[HEIGHT]")
             
-        print(f"Ссылка для использования: {link_example}")
+        print(f"Ссылка: {'/'.join(link_parts)}")
         print("-----------------------------")
         
         print("1. Настроить API ключ")
         print("2. Настроить имя модели")
-        print("3. Показать подробные настройки")
-        print("4. Запустить сервер")
-        print("5. Выход")
+        print("3. Настроить формат ссылки")
+        print("4. Показать подробные настройки")
+        print("5. Запустить сервер")
+        print("6. Выход")
         
         try:
-            choice = input("\nВыберите опцию [1-5]: ").strip()
+            choice = input("\nВыберите опцию [1-6]: ").strip()
         except (KeyboardInterrupt, EOFError):
             print("\nВыход...")
             break
@@ -165,198 +305,190 @@ def show_menu():
             save_config(config)
         elif choice == "2":
             configure_model_name(config)
+            # При смене модели сбрасываем настройки ссылки на дефолт модели?
+            # Или проверяем их валидность. configure_link_settings делает это при вызове, 
+            # но лучше бы авто-апдейтнуть. Пока оставим как есть.
             save_config(config)
         elif choice == "3":
-            show_settings(config)
+            configure_link_settings(config)
+            save_config(config)
         elif choice == "4":
+            show_settings(config)
+        elif choice == "5":
             if not config.get("api_key") or not config.get("model_name"):
-                print("❌ Сначала настройте API ключ и имя модели (опции 1 и 2)")
+                print("❌ Сначала настройте API ключ и имя модели")
                 continue
             start_server(config)
             break
-        elif choice == "5":
+        elif choice == "6":
             print("До свидания!")
             break
         else:
-            print("Неверная опция. Выберите от 1 до 5.")
+            print("Неверная опция.")
 
 # === HTTP сервер ===
 
 def get_cache_key(prompt, negative_prompt, width, height):
-    """Генерация уникального ключа для кэша (БЕЗ модели, общий кэш)"""
+    """Генерация уникального ключа для кэша (общий кэш)"""
     cache_string = f"{prompt}||{negative_prompt}||{width}||{height}"
     hash_obj = hashlib.md5(cache_string.encode('utf-8'))
     return f"{hash_obj.hexdigest()}.jpg"
 
 def check_cache(cache_filename):
-    """Проверка наличия файла в кэше"""
     filepath = os.path.join(CACHE_DIR, cache_filename)
     return filepath if os.path.exists(filepath) else None
 
 def save_to_cache(cache_filename, image_data):
-    """Сохранение изображения в кэш"""
     os.makedirs(CACHE_DIR, exist_ok=True)
     filepath = os.path.join(CACHE_DIR, cache_filename)
-    with open(filepath, 'wb') as f:
-        f.write(image_data)
+    with open(filepath, 'wb') as f: f.write(image_data)
     return filepath
 
 def log_message(message):
-    """Логирование с временной меткой"""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] {message}")
     sys.stdout.flush()
 
 def request_chutes_image(prompt, negative_prompt, width, height, config):
-    """Запрос генерации изображения в Chutes AI"""
+    """Запрос генерации изображения"""
     
     headers = {
         "Authorization": f"Bearer {config['api_key']}",
         "Content-Type": "application/json"
     }
     
-    provider_type = config.get("provider_type", "unified")
     model_name = config["model_name"]
+    info = get_model_info(model_name, config)
     
-    if provider_type == "chutes":
-        # Формат для "родных" моделей Chutes (z-image-turbo и т.д.)
-        # URL: https://chutes-{MODEL}.chutes.ai/generate
-        # Payload: ТОЛЬКО prompt (судя по примерам, они строгие к параметрам)
-        url = f"https://chutes-{model_name}.chutes.ai/generate"
-        
-        payload = {
-            "prompt": prompt
-        }
-        # Если нужно, можно попробовать добавить другие параметры, но пока строго по примеру пользователя
+    if not info:
+        raise Exception(f"Нет метаданных для модели {model_name}")
+    
+    # 1. URL
+    if info["type"] == "unified":
+        url = "https://image.chutes.ai/generate"
     else:
-        # Формат для остальных (Unified endpoint)
-        # URL: https://image.chutes.ai/generate
-        # Payload: с полем model
-        url = CHUTES_IMAGE_ENDPOINT
-        
-        payload = {
-            "model": model_name,
-            "prompt": prompt,
-            "negative_prompt": negative_prompt,
-            "width": width,
-            "height": height,
-            "num_inference_steps": 20,
-            "guidance_scale": 7.5
-        }
+        # Native
+        if "{model}" in info["url_template"]:
+            url = info["url_template"].format(model=model_name)
+        else:
+            url = info["url_template"]
+
+    # 2. Payload
+    payload = {"prompt": prompt}
     
-    response = requests.post(
-        url,
-        json=payload,
-        headers=headers,
-        timeout=60
-    )
+    # Unified models требуют параметр model
+    if info["type"] == "unified":
+        payload["model"] = model_name
+
+    # Добавляем negative_prompt если поддерживается
+    # Unified поддерживает всегда (по дефолту в базе KNOWN_MODELS)
+    # Native поддерживает если info['supports_negative'] is True
+    
+    supports_neg = info.get("supports_negative", True) if info["type"] == "unified" else info.get("supports_negative", False)
+    
+    if supports_neg and negative_prompt:
+        payload["negative_prompt"] = negative_prompt
+
+    # Добавляем разрешение
+    res_format = info.get("resolution_format", "standard") # standard, string, none
+    
+    if res_format == "standard":
+        payload["width"] = width
+        payload["height"] = height
+    elif res_format == "string":
+        payload["resolution"] = f"{width}x{height}"
+    
+    # Стандартные параметры (можно добавить проверку, но обычно они ок)
+    payload["num_inference_steps"] = 20
+    payload["guidance_scale"] = 7.5
+
+    response = requests.post(url, json=payload, headers=headers, timeout=60)
     
     if response.status_code == 200:
         return response.content
+    elif response.status_code == 400:
+         raise Exception(f"Ошибка 400 (Bad Request): {response.text[:200]}")
     elif response.status_code == 401:
         raise Exception("Неверный API ключ (401).")
     elif response.status_code == 404:
-        raise Exception(f"Модель '{config['model_name']}' не найдена (404).")
+        raise Exception(f"Модель/URL не найден (404).")
     elif response.status_code == 429:
-        raise Exception("Достигнут дневной лимит (300 запросов).")
+        raise Exception("Достигнут дневной лимит (429).")
     elif response.status_code == 500:
         raise Exception("Ошибка сервера Chutes (500).")
     else:
         raise Exception(f"HTTP {response.status_code}: {response.text[:200]}")
 
 def start_server(config):
-    """Запуск Flask HTTP-сервера"""
     app = Flask(__name__)
-    
-    # Отключаем стандартный логгер Flask, чтобы не засорять вывод
     import logging
     log = logging.getLogger('werkzeug')
     log.setLevel(logging.ERROR)
     
     @app.route('/prompt/<path:params>')
     def generate_image(params):
-        # Декодировать URL
         params = unquote(params)
-        
-        # Разделить по "/"
         parts = params.split('/')
         
-        # Парсинг параметров
+        # Парсинг URL с учетом настроек ссылки (какие части ожидать)
+        # Но сервер должен быть гибким: если части есть - берем, нет - дефолт
+        
         prompt = parts[0] if len(parts) > 0 else ""
-        
-        # negative_prompt может быть пропущен или обозначен как '-' или ' '
         negative_prompt = ""
-        if len(parts) > 1:
-            val = parts[1].strip()
-            if val and val not in ['-', '']:
-                negative_prompt = parts[1]
-        
-        # Размеры по умолчанию
         width = 1024
         height = 1024
         
-        if len(parts) > 2:
-            size_part = parts[2]
-            if 'x' in size_part:
+        # Попробуем умный парсинг оставшихся частей
+        remaining = parts[1:]
+        
+        for part in remaining:
+            part = part.strip()
+            if not part or part == '-': continue
+            
+            # Если похоже на разрешение (1024x1024)
+            if 'x' in part and part.replace('x','').isdigit():
                 try:
-                    w, h = size_part.lower().split('x')
+                    w, h = part.lower().split('x')
                     width = int(w)
                     height = int(h)
+                    continue
                 except:
-                    pass  # Оставить дефолтные
+                    pass
+            
+            # Если не разрешение, считаем это негативным промптом
+            # (Если негативный промпт еще не был установлен)
+            if not negative_prompt:
+                negative_prompt = part
         
-        # Логирование запроса
         neg_text = f'"{negative_prompt}"' if negative_prompt else '""'
         log_message(f'Запрос: "{prompt}" | Негатив: {neg_text} | Размер: {width}x{height}')
         
-        # Проверка кэша (БЕЗ имени модели, общий кэш)
         cache_file = get_cache_key(prompt, negative_prompt, width, height)
         cached = check_cache(cache_file)
         
         if cached:
-            log_message(f"Кэш: ПОПАДАНИЕ - возвращаем из кэша")
+            log_message(f"Кэш: ПОПАДАНИЕ")
             return send_file(cached, mimetype='image/jpeg')
         
-        # Генерация нового изображения
         log_message("Кэш: ПРОМАХ - генерируем...")
         try:
             start_time = time.time()
-            
             image_data = request_chutes_image(prompt, negative_prompt, width, height, config)
-            
             elapsed = time.time() - start_time
             log_message(f"Сгенерировано за {elapsed:.1f}с")
-            
-            # Сохранить в кэш
             save_to_cache(cache_file, image_data)
-            log_message(f"Сохранено: {cache_file}")
-            
-            # Вернуть изображение
             return Response(image_data, mimetype='image/jpeg')
-            
-        except requests.exceptions.Timeout:
-            error_msg = "Таймаут генерации. Попробуйте более простой промпт."
-            log_message(f"ОШИБКА: {error_msg}")
-            return Response(error_msg, status=504, mimetype='text/plain; charset=utf-8')
-        except requests.exceptions.RequestException as e:
-            error_msg = "Ошибка сети. Проверьте подключение к интернету."
-            log_message(f"ОШИБКА: {str(e)}")
-            return Response(error_msg, status=503, mimetype='text/plain; charset=utf-8')
         except Exception as e:
             log_message(f"ОШИБКА: {str(e)}")
             return Response(str(e), status=500, mimetype='text/plain; charset=utf-8')
     
     print(f"\n✓ Сервер запущен на http://localhost:{PORT}")
-    print(f"  Используемая модель: {config['model_name']}")
     print("Нажмите Ctrl+C для остановки\n")
     try:
         app.run(host='0.0.0.0', port=PORT, debug=False)
     except Exception as e:
         print(f"Ошибка при запуске сервера: {e}")
 
-# === Точка входа ===
-
 if __name__ == '__main__':
-    # Создаем папку кэша сразу при запуске
     os.makedirs(CACHE_DIR, exist_ok=True)
     show_menu()
