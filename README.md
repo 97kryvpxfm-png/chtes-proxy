@@ -20,7 +20,7 @@
 2. **Клонируйте репозиторий:**
    ```bash
    git clone https://github.com/97kryvpxfm-png/chtes-proxy
-   cd chutes-proxy
+   cd chtes-proxy
   
 
 3. **Установите зависимости:**
