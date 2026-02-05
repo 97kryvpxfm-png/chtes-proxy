@@ -19,7 +19,7 @@
 
 2. **Клонируйте репозиторий:**
    ```bash
-   https://github.com/97kryvpxfm-png/chtes-proxy
+   git clone https://github.com/97kryvpxfm-png/chtes-proxy
    cd chutes-proxy
   
 
