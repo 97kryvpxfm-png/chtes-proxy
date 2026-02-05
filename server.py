@@ -37,19 +37,22 @@ KNOWN_MODELS = {
         "type": "native",
         "url_template": "https://chutes-{model}.chutes.ai/generate",
         "supports_negative": False,
-        "resolution_format": "none"
+        "resolution_format": "none",
+        "include_extra_params": False
     },
     "hunyuan-image-3": {
         "type": "native",
         "url_template": "https://chutes-{model}.chutes.ai/generate",
         "supports_negative": False,
-        "resolution_format": "none"
+        "resolution_format": "none",
+        "include_extra_params": False
     },
     "hidream": {
         "type": "native",
         "url_template": "https://chutes-{model}.chutes.ai/generate",
         "supports_negative": False,
-        "resolution_format": "string" # resolution: "1024x1024"
+        "resolution_format": "string", # resolution: "1024x1024"
+        "include_extra_params": False
     }
 }
 
@@ -399,8 +402,9 @@ def request_chutes_image(prompt, negative_prompt, width, height, config):
         payload["resolution"] = f"{width}x{height}"
     
     # Стандартные параметры (можно добавить проверку, но обычно они ок)
-    payload["num_inference_steps"] = 20
-    payload["guidance_scale"] = 7.5
+    if info.get("include_extra_params", True):
+        payload["num_inference_steps"] = 20
+        payload["guidance_scale"] = 7.5
 
     response = requests.post(url, json=payload, headers=headers, timeout=60)
     
